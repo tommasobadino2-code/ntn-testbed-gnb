@@ -1,0 +1,27 @@
+
+cell_cfg:
+  ntn:
+    ntn_ul_sync_validity_dur: 5
+
+    t_service: '2026-10-01T11:50:11'
+
+    sat_switch_with_resync:
+      epoch_timestamp: '2026-10-01T11:45:11'
+      ephemeris_info_ecef:
+        pos_x: 0
+        pos_y: -9929860.4
+        pos_z: 10368905.9
+        vel_x: 0
+        vel_y: 3805.55
+        vel_z: 3644.41
+
+      t_service_start: '2026-10-01T11:50:11'
+
+      use_state_vector: true
+      ntn_ul_sync_validity_dur: 5
+
+      promote_to_serving: true
+      promote_neighbors: false
+
+log:
+  filename: /tmp/gnb_meo_satswitch.log
