@@ -1,9 +1,9 @@
 
 cu_cp:
   amf:
-    addr: 192.168.70.132
+    addr: 10.100.200.16
     port: 38412
-    bind_addr: 192.168.70.129
+    bind_addr: 10.100.200.1
     supported_tracking_areas:
       - tac: 1
         plmn_list:
@@ -18,7 +18,7 @@ cu_cp:
 cu_up:
   ngu:
     socket:
-      - bind_addr: 192.168.70.129
+      - bind_addr: 10.100.200.1
 
 ru_sdr:
   device_driver: rfsimulator

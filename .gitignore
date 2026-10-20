@@ -10,3 +10,5 @@
 /build
 /build_ntn
 
+build_ntn/
+nrL1_UE_stats*.log

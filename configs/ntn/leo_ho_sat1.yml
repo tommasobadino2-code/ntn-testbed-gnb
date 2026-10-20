@@ -4,8 +4,8 @@ ran_node_name: gnb-sat1
 
 cu_cp:
   amf:
-    addr: 192.168.1.115
-    bind_addr: 192.168.1.117
+    addr: 10.100.200.16
+    bind_addr: 10.100.200.1
     supported_tracking_areas:
       - tac: 1
         plmn_list:
@@ -60,7 +60,7 @@ cu_cp:
 cu_up:
   ngu:
     socket:
-      - bind_addr: 192.168.1.117
+      - bind_addr: 10.100.200.1
 
 ru_sdr:
   device_args: serveraddr=127.0.0.1,serverport=4043,options=chanmod,realtime
