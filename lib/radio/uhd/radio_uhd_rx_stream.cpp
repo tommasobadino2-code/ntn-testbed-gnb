@@ -5,6 +5,11 @@
 #include "ocudu/ocuduvec/zero.h"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <thread>
 
 using namespace ocudu;
 
@@ -186,11 +191,62 @@ void radio_uhd_rx_stream::set_channel_emulator(radio_uhd_channel_emulator& emu)
   for (unsigned ch = 0; ch != nof_channels; ++ch) {
     rx_shifters.emplace_back(0.0, srate_Hz);
   }
-  fmt::println("UHD channel emulator: rx stream {} delay line {:.0f} ms ({} samples x {} channels).",
+
+  // The integer delay only changes at step boundaries, aligned to the absolute timestamp. Default 1000 us = one slot
+  // at 15 kHz SCS, so a delay change never falls inside a slot (use 500 for 30 kHz SCS). The optional offset (in
+  // samples) moves the boundaries if the gNB slot grid is not aligned to timestamp multiples of the step.
+  double step_us = 1000.0;
+  if (const char* env = std::getenv("OCUDU_UHD_CHANNEL_EMU_STEP_US")) {
+    step_us = std::atof(env);
+  }
+  delay_step_len = std::max<uint64_t>(1, static_cast<uint64_t>(std::llround(step_us * 1e-6 * srate_Hz)));
+  if (const char* env = std::getenv("OCUDU_UHD_CHANNEL_EMU_STEP_OFFSET")) {
+    delay_step_offset = static_cast<uint64_t>(std::max(0LL, std::atoll(env))) % delay_step_len;
+  }
+  have_step_delay = false;
+
+  // Optional debug capture of the uplink as the PHY sees it (see radio_uhd_rx_stream.h).
+  if (const char* path = std::getenv("OCUDU_UHD_CHANNEL_EMU_CAPTURE")) {
+    double delay_s = 0.0, dur_s = 8.0;
+    if (const char* env = std::getenv("OCUDU_UHD_CHANNEL_EMU_CAPTURE_DELAY_S")) {
+      delay_s = std::max(0.0, std::atof(env));
+    }
+    if (const char* env = std::getenv("OCUDU_UHD_CHANNEL_EMU_CAPTURE_S")) {
+      dur_s = std::max(0.1, std::atof(env));
+    }
+    capture       = std::make_shared<capture_state>();
+    capture->path = path;
+    capture->buf.assign(static_cast<size_t>(dur_s * srate_Hz), ci16_t{0, 0});
+    capture_delay_sps = static_cast<uint64_t>(delay_s * srate_Hz);
+    std::thread([c = capture]() {
+      while (!c->full.load() && !c->abandon.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      if (!c->full.load()) {
+        return;
+      }
+      std::ofstream f(c->path, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(c->buf.data()), static_cast<std::streamsize>(c->buf.size() * sizeof(ci16_t)));
+      fmt::println("UHD channel emulator: uplink capture written to {} ({} samples, {}).",
+                   c->path,
+                   c->buf.size(),
+                   f.good() ? "ok" : "WRITE ERROR");
+    }).detach();
+    fmt::println("UHD channel emulator: uplink capture armed: {:.1f} s starting {:.1f} s after link-up -> {}.",
+                 dur_s,
+                 delay_s,
+                 path);
+  }
+
+  fmt::println("UHD channel emulator: rx stream {} delay line {:.0f} ms ({} samples x {} channels), delay steps every "
+               "{} samples ({:.1f} us), offset {}.",
                id,
                radio_uhd_channel_emulator::max_delay_s * 1e3,
                delay_capacity,
-               nof_channels);
+               nof_channels,
+               delay_step_len,
+               delay_step_len / srate_Hz * 1e6,
+               delay_step_offset);
 }
 
 void radio_uhd_rx_stream::apply_channel_emulation(baseband_gateway_buffer_writer& buffs, uint64_t ts)
@@ -217,12 +273,6 @@ void radio_uhd_rx_stream::apply_channel_emulation(baseband_gateway_buffer_writer
     have_data = true;
   }
 
-  // Delay for this block in samples: base delay plus drift since the last update.
-  const double elapsed_s = (ts > drift_base_ts) ? static_cast<double>(ts - drift_base_ts) / srate_Hz : 0.0;
-  const double delay_us  = p.delay_us + p.drift_us_per_s * elapsed_s;
-  int64_t      delay_sps = std::llround(std::max(delay_us, 0.0) * 1e-6 * srate_Hz);
-  delay_sps              = std::min<int64_t>(delay_sps, static_cast<int64_t>(cap - n - 1));
-
   // Uplink frequency shift: once used, keep the shifter running so its phase never jumps.
   rx_shifter_used  = rx_shifter_used || (p.rx_doppler_Hz != 0.0);
   const bool shift = rx_shifter_used;
@@ -243,15 +293,85 @@ void radio_uhd_rx_stream::apply_channel_emulation(baseband_gateway_buffer_writer
     std::copy(buf.begin(), buf.begin() + first, ring.begin() + pos);
     std::copy(buf.begin() + first, buf.end(), ring.begin());
 
-    // 3. Output what arrived delay_sps samples earlier; silence below the horizon or before any data existed.
+    // Silence below the horizon.
     if (!p.link_up) {
       std::fill(buf.begin(), buf.end(), ci16_t{0, 0});
-      continue;
     }
-    for (unsigned i = 0; i != n; ++i) {
-      const int64_t src = static_cast<int64_t>(ts + i) - delay_sps;
-      buf[i] = (src < static_cast<int64_t>(first_ts)) ? ci16_t{0, 0} : ring[static_cast<uint64_t>(src) % cap];
+  }
+  if (!p.link_up) {
+    return;
+  }
+
+  // 3. Output what arrived 'delay' samples earlier, before any data existed: silence. The delay is computed once per
+  //    step (base delay plus drift since the last update) and kept for the whole step, so the one-sample changes caused
+  //    by the drift happen only at step (slot) boundaries, never in the middle of a slot.
+  unsigned i = 0;
+  while (i != n) {
+    const uint64_t abs_ts   = ts + i;
+    const uint64_t step_idx = (abs_ts + delay_step_offset) / delay_step_len;
+    const uint64_t next_ts  = (step_idx + 1) * delay_step_len - delay_step_offset;
+    const unsigned seg_end  = static_cast<unsigned>(std::min<uint64_t>(n, next_ts - ts));
+
+    if (!have_step_delay || step_idx != current_step) {
+      const double elapsed_s =
+          (abs_ts > drift_base_ts) ? static_cast<double>(abs_ts - drift_base_ts) / srate_Hz : 0.0;
+      const double delay_us = p.delay_us + p.drift_us_per_s * elapsed_s;
+      current_step_delay    = std::llround(std::max(delay_us, 0.0) * 1e-6 * srate_Hz);
+      current_step          = step_idx;
+      have_step_delay       = true;
     }
+    const int64_t delay_sps = std::min<int64_t>(current_step_delay, static_cast<int64_t>(cap - n - 1));
+
+    for (unsigned ch = 0; ch != nof_channels; ++ch) {
+      span<ci16_t>               buf  = buffs[ch];
+      const std::vector<ci16_t>& ring = delay_ring[ch];
+      for (unsigned k = i; k != seg_end; ++k) {
+        const int64_t src = static_cast<int64_t>(ts + k) - delay_sps;
+        buf[k] = (src < static_cast<int64_t>(first_ts)) ? ci16_t{0, 0} : ring[static_cast<uint64_t>(src) % cap];
+      }
+    }
+    i = seg_end;
+  }
+
+  if (capture) {
+    capture_samples(buffs[0], ts);
+  }
+}
+
+void radio_uhd_rx_stream::capture_samples(span<const ci16_t> buf, uint64_t ts)
+{
+  capture_state& c = *capture;
+  if (c.full.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (!capture_running) {
+    if (!capture_link_seen) {
+      capture_link_seen = true;
+      capture_link_ts   = ts;
+    }
+    if (ts < capture_link_ts + capture_delay_sps) {
+      return;
+    }
+    capture_running = true;
+    // Wall-clock time of the first captured sample, to line it up with the gNB log (which is in UTC).
+    const auto        now = std::chrono::system_clock::now();
+    const std::time_t t   = std::chrono::system_clock::to_time_t(now);
+    const int         ms  = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm utc{};
+    gmtime_r(&t, &utc);
+    fmt::println("UHD channel emulator: uplink capture started at {:02}:{:02}:{:02}.{:03} UTC (timestamp {}).",
+                 utc.tm_hour,
+                 utc.tm_min,
+                 utc.tm_sec,
+                 ms,
+                 ts);
+  }
+  const uint64_t take = std::min<uint64_t>(buf.size(), c.buf.size() - capture_pos);
+  std::copy(buf.begin(), buf.begin() + take, c.buf.begin() + capture_pos);
+  capture_pos += take;
+  if (capture_pos == c.buf.size()) {
+    c.full.store(true);
   }
 }
 

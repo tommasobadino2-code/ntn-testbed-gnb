@@ -12,6 +12,9 @@
 #include "ocudu/radio/radio_configuration.h"
 #include "ocudu/radio/radio_event_notifier.h"
 #include "ocudu/support/synchronization/stop_event.h"
+#include <atomic>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace ocudu {
@@ -57,9 +60,35 @@ class radio_uhd_rx_stream : public uhd_exception_handler, public baseband_gatewa
   uint64_t drift_base_ts   = 0;
   uint64_t first_ts        = 0;
   bool     have_data       = false;
+  /// Delay steps: the integer delay only changes every delay_step_len samples (aligned to the absolute timestamp).
+  uint64_t delay_step_len     = 1;
+  uint64_t delay_step_offset  = 0;
+  uint64_t current_step       = 0;
+  int64_t  current_step_delay = 0;
+  bool     have_step_delay    = false;
 
   /// Applies the emulated channel in place to a received buffer whose first sample has timestamp \c ts.
   void apply_channel_emulation(baseband_gateway_buffer_writer& buffs, uint64_t ts);
+
+  /// \brief Optional debug capture of the uplink exactly as the PHY receives it (after Doppler and delay).
+  ///
+  /// Enabled with OCUDU_UHD_CHANNEL_EMU_CAPTURE=<file>. Starts OCUDU_UHD_CHANNEL_EMU_CAPTURE_DELAY_S (default 0) after
+  /// the link first comes up, records OCUDU_UHD_CHANNEL_EMU_CAPTURE_S seconds (default 8) of channel 0 into memory,
+  /// then a background thread writes them as interleaved int16 I/Q. The state is shared with that thread so it stays
+  /// valid even if the stream is destroyed first.
+  struct capture_state {
+    std::vector<ci16_t> buf;
+    std::string         path;
+    std::atomic<bool>   full{false};
+    std::atomic<bool>   abandon{false};
+  };
+  std::shared_ptr<capture_state> capture;
+  uint64_t                       capture_pos       = 0;
+  uint64_t                       capture_delay_sps = 0;
+  uint64_t                       capture_link_ts   = 0;
+  bool                           capture_link_seen = false;
+  bool                           capture_running   = false;
+  void                           capture_samples(span<const ci16_t> buf, uint64_t ts);
   ///@}
 
   bool receive_block(unsigned&                       nof_rxd_samples,
