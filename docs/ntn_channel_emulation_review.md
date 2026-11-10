@@ -164,9 +164,9 @@ continuously.
 [computed]
 
 **Does it matter?** At the LEO horizon (where you test) no. Near zenith, a 100-200 Hz sawtooth on the UL is
-comparable to the UE pre-compensation residual you already see (+170/+340 Hz) and, on a format-1 PRACH, worth
-1-2 us of TA bias (12.4 us per 1.25 kHz, see g). For B4 PRACH and PUSCH (with the CFO estimator on) it is
-harmless.
+comparable to the UE pre-compensation residual you already see (+170/+340 Hz); on a format-1 PRACH it moves
+energy from the true peak into an alias 12.4 us away (see g; the TA itself only jumps once the total error
+passes ~half a bin, 625 Hz). For B4 PRACH and PUSCH (with the CFO estimator on) it is harmless.
 
 **How to check it.** Zenith run (`set_leo_pass.sh --single --elev 80`), v4 capture of 1 s, then estimate the
 PUSCH DMRS phase slope per slot: you should see a sawtooth with a 160 ms period and a peak-to-peak close to
@@ -233,8 +233,9 @@ sed 's/\x1b\[[0-9;]*m//g' /tmp/ue_leo_uhd.log | grep -a "timing_advance_ntn" | h
 - *Independent oscillators* [measured]: residual UL +170 Hz (mode 1) / +340 Hz (mode 3) ≈ 0.17 ppm relative.
   Same ppm on the sample clock: 2.6 samples/s, 0.17 us/s of timing drift, followed by the UE time tracking and
   the gNB TA loop. Harmless with PUSCH CFO compensation on, **not harmless for format 1 PRACH**: 340 Hz is
-  27 % of a 1.25 kHz bin, i.e. a ~3.4 us TA bias and a peak split into two bins (point g). B4 (15 kHz SCS)
-  tolerates it.
+  27 % of a 1.25 kHz bin: about 1 dB of correlation loss and an alias peak 12.4 us late at roughly -10 dB
+  (point g); with any further error of ~300 Hz the alias wins and the TA jumps by 12.4 us. B4 (15 kHz SCS)
+  tolerates it (2 % of a bin).
 - *TX/RX turnaround and buffering*: FDD with continuous streams, so no turnaround; what matters is the
   fixed TX-to-RX latency of each radio. `-A 216` (14.06 us) on the UE and `time_alignment_calibration`
   (default 0, `apps/units/flexible_o_du/split_8/helpers/ru_sdr_config_translator.cpp:41-47`) on the gNB are the
@@ -317,11 +318,12 @@ orders of magnitude smaller. Two things combine:
 
 1. *Why format 1 is fragile* [code + 38.211]: the 839-length sequence with ΔfRA = 1.25 kHz maps a frequency
    offset Δf onto a cyclic shift of (Δf/1.25 kHz) x (u^-1 mod 839) samples (13 samples = 12.4 us per 1.25 kHz
-   for u = 710, unrestricted set). Any residual above a few hundred Hz biases the TA by microseconds; tens of
-   kHz move it by hundreds of us and the gNB happily reports the alias. B4 (139-length, 15 kHz SCS) needs
-   ~12x more frequency error for the same effect and detection degrades before it misleads. This is why
-   index 209 fixes the symptom even though the cause below is not removed, and why the B200's own +340 Hz
-   residual already costs ~3 us on format 1.
+   for u = 710, unrestricted set). Precisely: the integer part of Δf/1.25 kHz sets the shift; a fractional
+   part splits the energy between two neighbouring shifts, so the TA is right until the error passes ~625 Hz,
+   then jumps by 12.4 us per bin; tens of kHz move it by hundreds of us and the gNB happily reports the
+   alias. B4 (139-length, 15 kHz SCS) needs 12x more frequency error for the same effect (7.5 kHz). This is
+   why index 209 fixes the symptom even though the cause below is not removed, and why the B200's own
+   +340 Hz residual already leaves format 1 with only ~300 Hz of margin.
 2. *Why only the first preamble* [hypothesis, not proven]: the UE sends the first preamble with its UL
    Doppler pre-compensation missing or partial. The evidence points at the UE TX chain around the switch to
    NTN timing; I checked the mechanisms you named:

@@ -9,6 +9,10 @@ known to arrive correctly (Doppler off), and the frequency shift between the two
 
 Why: for this PRACH root, every 1.25 kHz of frequency error moves the correlation peak the gNB uses for
 timing by about 12.4 us. A shift of ~40 kHz would therefore look like a ~400 us timing error.
+
+--short: the capture uses a short preamble (e.g. B4, prach_config_index 209): 139 subcarriers at 15 kHz,
+~2.1 MHz wide. The frequency shift is still measured, but the 12.4 us/1.25 kHz timing rule does not apply
+(a short preamble only loses correlation until the error approaches 7.5 kHz).
 """
 import argparse
 import numpy as np
@@ -96,6 +100,7 @@ def main():
     ap.add_argument("--ref")
     ap.add_argument("--window", nargs=2, type=float, default=[0.0, 2.0], metavar=("T0", "T1"),
                     help="search the PRACH between these times in the capture (s), default 0 2")
+    ap.add_argument("--short", action="store_true", help="short preamble (B4, 139 x 15 kHz) instead of format 0/1")
     a = ap.parse_args()
     f, p, c = report("capture  ", load(a.capture), *a.window)
     if a.ref:
@@ -103,8 +108,12 @@ def main():
         s = shift_between(f, p, pr)
         print(f"=> PRACH frequency shift capture - reference: {s:+.0f} Hz (spectrum match), "
               f"{c - cr:+.0f} Hz (band centre)")
-        print("   (the band edges above are the most direct reading; check that both widths are ~1050 kHz)")
-        print(f"   as a timing error for this root (~12.4 us per 1.25 kHz): about {abs(s) / 1250 * 12.4:.0f} us")
+        if a.short:
+            print("   (the band edges above are the most direct reading; check that both widths are ~2085 kHz)")
+            print(f"   short preamble: {abs(s) / 15e3 * 100:.0f} % of a 15 kHz subcarrier (detection degrades near 50 %)")
+        else:
+            print("   (the band edges above are the most direct reading; check that both widths are ~1050 kHz)")
+            print(f"   as a timing error for this root (~12.4 us per 1.25 kHz): about {abs(s) / 1250 * 12.4:.0f} us")
 
 
 if __name__ == "__main__":
