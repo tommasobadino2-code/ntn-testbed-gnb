@@ -18,7 +18,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 D=$HERE/configs/ntn
-BASE=$D/meo_rfsim_gnb.yml; SW=$D/meo_satswitch.yml; TRAIN=$D/meo_sattrain.yml
+BASE=${BASE:-$D/meo_rfsim_gnb.yml}; SW=$D/meo_satswitch.yml; TRAIN=$D/meo_sattrain.yml
 HO1=$D/meo_ho_sat1.yml;    HO2=$D/meo_ho_sat2.yml
 
 usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BASE=$HERE/configs/ntn/leo_rfsim_gnb.yml
+BASE=${BASE:-$HERE/configs/ntn/leo_rfsim_gnb.yml}
 SAT1=$HERE/configs/ntn/leo_ho_sat1.yml
 SAT2=$HERE/configs/ntn/leo_ho_sat2.yml
 
