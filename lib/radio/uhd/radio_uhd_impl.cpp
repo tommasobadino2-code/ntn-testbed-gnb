@@ -451,6 +451,23 @@ radio_session_uhd_impl::radio_session_uhd_impl(const radio_configuration::radio&
     }
   }
 
+  // Software channel emulator (mode from OCUDU_UHD_CHANNEL_EMU; off by default).
+  {
+    double tx_freq_Hz = 0.0;
+    double rx_freq_Hz = 0.0;
+    if (!radio_config.tx_streams.empty() && !radio_config.tx_streams.front().channels.empty()) {
+      tx_freq_Hz = radio_config.tx_streams.front().channels.front().freq.center_frequency_Hz;
+    }
+    if (!radio_config.rx_streams.empty() && !radio_config.rx_streams.front().channels.empty()) {
+      rx_freq_Hz = radio_config.rx_streams.front().channels.front().freq.center_frequency_Hz;
+    }
+    channel_emulator = std::make_unique<radio_uhd_channel_emulator>(actual_rx_rate_Hz, tx_freq_Hz, rx_freq_Hz);
+    for (auto& gateway : bb_gateways) {
+      gateway->get_rx_stream().set_channel_emulator(*channel_emulator);
+      gateway->get_tx_stream().set_channel_emulator(*channel_emulator);
+    }
+  }
+
   // Restore thread priorities.
   if (uhd_set_thread_priority(0, false) != UHD_ERROR_NONE) {
     fmt::print("Error: setting UHD thread priority.\n");
@@ -543,4 +560,18 @@ std::unique_ptr<radio_session> radio_factory_uhd_impl::create(const radio_config
   }
 
   return session;
+}
+
+bool radio_session_uhd_impl::set_ntn_channel(double one_way_delay_us,
+                                             double delay_drift_us_per_s,
+                                             double service_drift_us_per_s,
+                                             bool   emulate_doppler,
+                                             bool   link_up)
+{
+  if (!is_init_successful || channel_emulator == nullptr) {
+    return false;
+  }
+  // Same placement as the TOSSI rfsim: the whole (round-trip sized) delay on the gNB receive side.
+  return channel_emulator->set_from_orbit(
+      one_way_delay_us, delay_drift_us_per_s, service_drift_us_per_s, emulate_doppler, link_up);
 }

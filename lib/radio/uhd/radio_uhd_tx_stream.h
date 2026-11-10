@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "coarse_freq_offset.h"
+#include "radio_uhd_channel_emulator.h"
 #include "radio_uhd_exception_handler.h"
 #include "radio_uhd_multi_usrp.h"
 #include "radio_uhd_tx_stream_fsm.h"
@@ -13,6 +15,8 @@
 #include "ocudu/radio/radio_event_notifier.h"
 #include "ocudu/support/executors/task_executor.h"
 #include "ocudu/support/synchronization/stop_event.h"
+#include <memory>
+#include <vector>
 
 namespace ocudu {
 
@@ -99,11 +103,30 @@ public:
   void transmit(const baseband_gateway_buffer_reader&        data,
                 const baseband_gateway_transmitter_metadata& metadata) override;
 
+  /// \brief Connects the software channel emulator (see radio_uhd_channel_emulator.h).
+  /// Must be called before the stream starts (not from the real-time thread).
+  void set_channel_emulator(radio_uhd_channel_emulator& emu);
+
   /// Start the transmission.
   void start();
 
   /// Stop the transmission.
   void stop();
+
+private:
+  /// Transmits the samples to UHD (the original transmit path).
+  void transmit_to_uhd(const baseband_gateway_buffer_reader&        data,
+                       const baseband_gateway_transmitter_metadata& metadata);
+
+  /// \name Software channel emulation (see radio_uhd_channel_emulator.h).
+  ///@{
+  radio_uhd_channel_emulator*                      emulator = nullptr;
+  std::unique_ptr<baseband_gateway_buffer_dynamic> emu_scratch;
+  /// Per-channel downlink frequency shifters (OAI emulator's Coarse_Freq_Offset).
+  std::vector<Coarse_Freq_Offset> tx_shifters;
+  /// Once used, the shifter keeps running (also at 0 Hz) so its phase stays continuous.
+  bool tx_shifter_used = false;
+  ///@}
 };
 
 } // namespace ocudu

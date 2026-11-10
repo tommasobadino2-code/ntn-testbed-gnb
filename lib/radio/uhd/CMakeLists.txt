@@ -6,7 +6,9 @@ set(SOURCES_UHD
         radio_config_uhd_validator.cpp
         radio_uhd_impl.cpp
         radio_uhd_rx_stream.cpp
-        radio_uhd_tx_stream.cpp)
+        radio_uhd_tx_stream.cpp
+        radio_uhd_channel_emulator.cpp
+        coarse_freq_offset.cpp)
 
 add_library(ocudu_radio_uhd STATIC ${SOURCES_UHD})
 

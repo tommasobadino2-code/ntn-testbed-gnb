@@ -5,6 +5,7 @@
 
 #include "radio_config_uhd_validator.h"
 #include "radio_uhd_baseband_gateway.h"
+#include "radio_uhd_channel_emulator.h"
 #include "radio_uhd_device.h"
 #include "radio_uhd_device_type.h"
 #include "radio_uhd_multi_usrp.h"
@@ -28,6 +29,8 @@ class radio_session_uhd_impl : public radio_session, private radio_management_pl
   /// Indexes the receiver port indexes into stream and channel index as first and second.
   static_vector<port_to_stream_channel, RADIO_MAX_NOF_PORTS> rx_port_map;
   /// Baseband gateways.
+  /// Software channel emulator (declared before the gateways so it outlives the streams that use it).
+  std::unique_ptr<radio_uhd_channel_emulator> channel_emulator;
   std::vector<std::unique_ptr<radio_uhd_baseband_gateway>> bb_gateways;
   double                                                   actual_sampling_rate_Hz = 0.0;
 
@@ -114,6 +117,13 @@ public:
 
   // See interface for documentation.
   baseband_gateway_timestamp read_current_time() override;
+
+  // See interface for documentation. Feeds the software channel emulator in orbit mode (OCUDU_UHD_CHANNEL_EMU=orbit).
+  bool set_ntn_channel(double one_way_delay_us,
+                       double delay_drift_us_per_s,
+                       double service_drift_us_per_s,
+                       bool   emulate_doppler,
+                       bool   link_up) override;
 };
 
 /// Factory for UHD radio session.

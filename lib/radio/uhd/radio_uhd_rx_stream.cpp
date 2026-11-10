@@ -3,6 +3,8 @@
 
 #include "radio_uhd_rx_stream.h"
 #include "ocudu/ocuduvec/zero.h"
+#include <algorithm>
+#include <cmath>
 
 using namespace ocudu;
 
@@ -164,8 +166,93 @@ baseband_gateway_receiver::metadata radio_uhd_rx_stream::receive(baseband_gatewa
     }
   }
 
+  // Software channel emulation (no-op unless enabled with OCUDU_UHD_CHANNEL_EMU).
+  apply_channel_emulation(buffs, ret.ts);
+
   // If it reaches here, there is no error.
   return ret;
+}
+
+void radio_uhd_rx_stream::set_channel_emulator(radio_uhd_channel_emulator& emu)
+{
+  emulator = &emu;
+  if (!is_init_successful || emu.get_mode() == radio_uhd_channel_emulator::mode::off) {
+    return;
+  }
+
+  delay_capacity = static_cast<uint64_t>(std::ceil(radio_uhd_channel_emulator::max_delay_s * srate_Hz));
+  delay_ring.assign(nof_channels, std::vector<ci16_t>(delay_capacity, ci16_t{0, 0}));
+  rx_shifters.clear();
+  for (unsigned ch = 0; ch != nof_channels; ++ch) {
+    rx_shifters.emplace_back(0.0, srate_Hz);
+  }
+  fmt::println("UHD channel emulator: rx stream {} delay line {:.0f} ms ({} samples x {} channels).",
+               id,
+               radio_uhd_channel_emulator::max_delay_s * 1e3,
+               delay_capacity,
+               nof_channels);
+}
+
+void radio_uhd_rx_stream::apply_channel_emulation(baseband_gateway_buffer_writer& buffs, uint64_t ts)
+{
+  if (emulator == nullptr || delay_capacity == 0 || !emulator->is_active()) {
+    return;
+  }
+
+  const uint64_t cap = delay_capacity;
+  const unsigned n   = buffs[0].size();
+  if (n == 0 || n >= cap) {
+    return;
+  }
+
+  const radio_uhd_channel_emulator::parameters p = emulator->get_parameters();
+
+  // Re-anchor the delay drift on every parameter update (same scheme as the rfsim NTN channel).
+  if (p.update_seq != seen_update_seq) {
+    seen_update_seq = p.update_seq;
+    drift_base_ts   = ts;
+  }
+  if (!have_data) {
+    first_ts  = ts;
+    have_data = true;
+  }
+
+  // Delay for this block in samples: base delay plus drift since the last update.
+  const double elapsed_s = (ts > drift_base_ts) ? static_cast<double>(ts - drift_base_ts) / srate_Hz : 0.0;
+  const double delay_us  = p.delay_us + p.drift_us_per_s * elapsed_s;
+  int64_t      delay_sps = std::llround(std::max(delay_us, 0.0) * 1e-6 * srate_Hz);
+  delay_sps              = std::min<int64_t>(delay_sps, static_cast<int64_t>(cap - n - 1));
+
+  // Uplink frequency shift: once used, keep the shifter running so its phase never jumps.
+  rx_shifter_used  = rx_shifter_used || (p.rx_doppler_Hz != 0.0);
+  const bool shift = rx_shifter_used;
+
+  for (unsigned ch = 0; ch != nof_channels; ++ch) {
+    span<ci16_t>         buf  = buffs[ch];
+    std::vector<ci16_t>& ring = delay_ring[ch];
+
+    // 1. Uplink Doppler (as in the OAI emulator: shift first, then delay).
+    if (shift) {
+      rx_shifters[ch].set_freq(static_cast<float>(2.0 * M_PI * p.rx_doppler_Hz / srate_Hz), static_cast<float>(n) - 1.0f);
+      rx_shifters[ch].freq_shift(buf.data(), static_cast<int>(n));
+    }
+
+    // 2. Store the samples at their own timestamps.
+    uint64_t pos   = ts % cap;
+    unsigned first = static_cast<unsigned>(std::min<uint64_t>(n, cap - pos));
+    std::copy(buf.begin(), buf.begin() + first, ring.begin() + pos);
+    std::copy(buf.begin() + first, buf.end(), ring.begin());
+
+    // 3. Output what arrived delay_sps samples earlier; silence below the horizon or before any data existed.
+    if (!p.link_up) {
+      std::fill(buf.begin(), buf.end(), ci16_t{0, 0});
+      continue;
+    }
+    for (unsigned i = 0; i != n; ++i) {
+      const int64_t src = static_cast<int64_t>(ts + i) - delay_sps;
+      buf[i] = (src < static_cast<int64_t>(first_ts)) ? ci16_t{0, 0} : ring[static_cast<uint64_t>(src) % cap];
+    }
+  }
 }
 
 bool radio_uhd_rx_stream::stop()

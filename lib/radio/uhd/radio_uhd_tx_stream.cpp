@@ -3,6 +3,8 @@
 
 #include "radio_uhd_tx_stream.h"
 #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_reader_view.h"
+#include <algorithm>
+#include <cmath>
 #include "ocudu/ocuduvec/zero.h"
 #include <uhd/version.hpp>
 
@@ -179,8 +181,55 @@ radio_uhd_tx_stream::radio_uhd_tx_stream(uhd::usrp::multi_usrp::sptr& usrp,
   state_fsm.init_successful();
 }
 
+void radio_uhd_tx_stream::set_channel_emulator(radio_uhd_channel_emulator& emu)
+{
+  emulator = &emu;
+  if (emu.get_mode() == radio_uhd_channel_emulator::mode::off) {
+    return;
+  }
+  // Scratch buffer for the processed samples; sized for 10 ms and grown if a larger block ever arrives.
+  emu_scratch = std::make_unique<baseband_gateway_buffer_dynamic>(nof_channels, static_cast<unsigned>(srate_hz / 100.0));
+  tx_shifters.clear();
+  for (unsigned ch = 0; ch != nof_channels; ++ch) {
+    tx_shifters.emplace_back(0.0, srate_hz);
+  }
+}
+
 void radio_uhd_tx_stream::transmit(const baseband_gateway_buffer_reader&        data,
                                    const baseband_gateway_transmitter_metadata& tx_md)
+{
+  // Software channel emulation (no-op unless enabled with OCUDU_UHD_CHANNEL_EMU).
+  if (emulator != nullptr && emu_scratch != nullptr && emulator->is_active()) {
+    const radio_uhd_channel_emulator::parameters p = emulator->get_parameters();
+    tx_shifter_used                                 = tx_shifter_used || (p.tx_doppler_Hz != 0.0);
+
+    const unsigned n = data.get_nof_samples();
+    if (n > 0 && (!p.link_up || tx_shifter_used)) {
+      if (n > emu_scratch->get_nof_samples()) {
+        emu_scratch->resize(n);
+      }
+      for (unsigned ch = 0; ch != nof_channels; ++ch) {
+        span<const ci16_t> in  = data.get_channel_buffer(ch);
+        span<ci16_t>       out = (*emu_scratch)[ch].first(n);
+        if (!p.link_up) {
+          // Satellite below the horizon: the UE receives nothing.
+          std::fill(out.begin(), out.end(), ci16_t{0, 0});
+          continue;
+        }
+        std::copy(in.begin(), in.begin() + n, out.begin());
+        tx_shifters[ch].set_freq(static_cast<float>(2.0 * M_PI * p.tx_doppler_Hz / srate_hz), static_cast<float>(n) - 1.0f);
+        tx_shifters[ch].freq_shift(out.data(), static_cast<int>(n));
+      }
+      transmit_to_uhd(baseband_gateway_buffer_reader_view(emu_scratch->get_reader(), 0, n), tx_md);
+      return;
+    }
+  }
+
+  transmit_to_uhd(data, tx_md);
+}
+
+void radio_uhd_tx_stream::transmit_to_uhd(const baseband_gateway_buffer_reader&        data,
+                                          const baseband_gateway_transmitter_metadata& tx_md)
 {
   auto token = stop_control.get_token();
   if (OCUDU_UNLIKELY(token.is_stop_requested())) {

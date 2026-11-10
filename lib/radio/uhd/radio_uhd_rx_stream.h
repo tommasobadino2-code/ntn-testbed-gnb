@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "coarse_freq_offset.h"
+#include "radio_uhd_channel_emulator.h"
 #include "radio_uhd_exception_handler.h"
 #include "radio_uhd_multi_usrp.h"
 #include "ocudu/gateways/baseband/baseband_gateway_receiver.h"
@@ -10,6 +12,7 @@
 #include "ocudu/radio/radio_configuration.h"
 #include "ocudu/radio/radio_event_notifier.h"
 #include "ocudu/support/synchronization/stop_event.h"
+#include <vector>
 
 namespace ocudu {
 
@@ -39,6 +42,26 @@ class radio_uhd_rx_stream : public uhd_exception_handler, public baseband_gatewa
   /// \param[in] buffer_offset Indicates the data offset in the reception buffers.
   /// \param[in] metadata Provides the reception metadata.
   /// \return True if no exception is caught. Otherwise false.
+  /// \name Software channel emulation (see radio_uhd_channel_emulator.h).
+  ///@{
+  radio_uhd_channel_emulator*      emulator = nullptr;
+  /// Per-channel delay line, indexed by absolute receive timestamp modulo its capacity.
+  std::vector<std::vector<ci16_t>> delay_ring;
+  uint64_t                         delay_capacity = 0;
+  /// Per-channel uplink frequency shifters (OAI emulator's Coarse_Freq_Offset).
+  std::vector<Coarse_Freq_Offset> rx_shifters;
+  /// Once used, the shifter keeps running (also at 0 Hz) so its phase stays continuous.
+  bool                            rx_shifter_used = false;
+  /// Receive-thread state.
+  uint64_t seen_update_seq = 0;
+  uint64_t drift_base_ts   = 0;
+  uint64_t first_ts        = 0;
+  bool     have_data       = false;
+
+  /// Applies the emulated channel in place to a received buffer whose first sample has timestamp \c ts.
+  void apply_channel_emulation(baseband_gateway_buffer_writer& buffs, uint64_t ts);
+  ///@}
+
   bool receive_block(unsigned&                       nof_rxd_samples,
                      baseband_gateway_buffer_writer& buffs,
                      unsigned                        buffer_offset,
@@ -78,6 +101,10 @@ public:
 
   /// Gets the optimal transmitter buffer size.
   unsigned get_buffer_size() const { return max_packet_size; }
+
+  /// \brief Connects the software channel emulator. Allocates the delay line unless the emulator is off.
+  /// Must be called before the stream starts (not from the real-time thread).
+  void set_channel_emulator(radio_uhd_channel_emulator& emu);
 
   // See interface for documentation.
   metadata receive(baseband_gateway_buffer_writer& data) override;
