@@ -17,37 +17,53 @@ is the burst's arrival position within its slot, convention-free and without the
 the frequency-domain PRACH dump. For B4 bursts, compare positions across RA attempts: the spread is the true
 UE timing scatter; the absolute value (minus the PRACH CP) is the arrival offset that time_alignment_
 calibration moves (cal of -N samples makes arrivals N samples later).
+
+Detection is on block POWER: a burst that fills only part of the bandwidth (B4: ~2.1 of 15.36 MHz) raises
+the wideband power by 1 + SNR_inband * bw_fraction, so the default threshold is 2x the median block power,
+held for at least --min-ms. When nothing is found, the block-power percentiles are printed to pick --thr.
 """
 import argparse
 import re
 import sys
 import numpy as np
 
-BLOCK = 64  # power averaging block, samples
+BLOCK = 64  # power averaging block, sample pairs
 
 
 def block_power(data, fs, t0, t1):
-    """Mean |I|+|Q| per BLOCK-sample block between t0 and t1 seconds (memmap-friendly, chunked)."""
+    """Mean per-sample power (I^2+Q^2) per BLOCK-sample block between t0 and t1 s (memmap-friendly)."""
     i0 = int(t0 * fs) // BLOCK * BLOCK
-    i1 = min(int(t1 * fs), (data.size // 2) // BLOCK * BLOCK * 1)
+    i1 = min(int(t1 * fs), (data.size // 2) // BLOCK * BLOCK)
     n_blocks = (i1 - i0) // BLOCK
     out = np.empty(n_blocks, dtype=np.float32)
-    chunk = 1 << 22  # samples per chunk
+    chunk = 1 << 22  # sample pairs per chunk
     done = 0
     while done < n_blocks:
         nb = min(chunk // BLOCK, n_blocks - done)
         s = i0 + done * BLOCK
         seg = data[2 * s: 2 * (s + nb * BLOCK)].astype(np.float32)
-        out[done:done + nb] = np.abs(seg).reshape(nb, 2 * BLOCK).mean(axis=1)
+        seg *= seg
+        out[done:done + nb] = seg.reshape(nb, 2 * BLOCK).sum(axis=1) / BLOCK
         done += nb
     return i0, out
 
 
+def refine_start(data, a, lvl, floor):
+    """First sample pair (searching from 2 blocks before a) whose smoothed power crosses midway to the burst."""
+    lo = max(0, a - 2 * BLOCK)
+    seg = data[2 * lo: 2 * (a + 2 * BLOCK)].astype(np.float32)
+    seg *= seg
+    pw = seg.reshape(-1, 2).sum(axis=1)
+    sm = np.convolve(pw, np.ones(32) / 32, mode="same")
+    idx = np.flatnonzero(sm > (floor + lvl) / 2)
+    return lo + int(idx[0]) if idx.size else a
+
+
 def find_bursts(data, fs, t0, t1, min_ms, gap_ms, thr_factor):
     i0, p = block_power(data, fs, t0, t1)
-    floor = np.median(p)
+    floor = float(np.median(p))
     if floor <= 0:
-        floor = np.mean(p) + 1e-9
+        floor = float(np.mean(p)) + 1e-9
     on = p > floor * thr_factor
     min_blocks = max(1, int(min_ms * 1e-3 * fs / BLOCK))
     gap_blocks = max(1, int(gap_ms * 1e-3 * fs / BLOCK))
@@ -66,16 +82,11 @@ def find_bursts(data, fs, t0, t1, min_ms, gap_ms, thr_factor):
         if end - k >= min_blocks:
             a = i0 + k * BLOCK
             b = i0 + end * BLOCK
-            # refine the start: first block (at 1-sample steps over +-2 blocks) above half the burst level
-            lvl = np.median(p[k:end])
-            lo = max(0, a - 2 * BLOCK)
-            seg = np.abs(data[2 * lo: 2 * (a + 2 * BLOCK)].astype(np.float32))
-            amp = seg.reshape(-1, 2).sum(axis=1)
-            idx = np.flatnonzero(np.convolve(amp, np.ones(16) / 16, mode="same") > lvl)
-            start = lo + int(idx[0]) if idx.size else a
-            bursts.append((start, b - start, 20 * np.log10(max(lvl, 1e-9) / 32768.0 / 2)))
+            lvl = float(np.median(p[k:end]))
+            start = refine_start(data, a, lvl, floor)
+            bursts.append((start, b - start, 10 * np.log10(lvl / floor)))
         k = j
-    return bursts, floor
+    return bursts, floor, p
 
 
 def selftest():
@@ -83,22 +94,23 @@ def selftest():
     spslot = int(fs // 1000)
     rng = np.random.default_rng(3)
     n = int(2.0 * fs)
-    x = (rng.normal(size=2 * n) * 20).astype(np.int16)
+    x = (rng.normal(size=2 * n) * 100).astype(np.int16)  # noise RMS 100 per component
     start_ts = 123456
     truth = []
-    for t_slot, off in [(300, 1000), (900, 980), (1500, 1021)]:  # slot index, offset in slot
-        s = t_slot * spslot + off - start_ts % spslot * 0  # sample index in capture
+    # bursts at 9x, 9x and 3.2x the noise power (the last ~ a weak preamble filling 2 MHz of 15 MHz)
+    for t_slot, off, sigma in [(300, 1000, 300), (900, 980, 300), (1500, 1021, 180)]:
         s = t_slot * spslot + off
         burst = int(0.86e-3 * fs)
-        x[2 * s: 2 * (s + burst)] = (rng.normal(size=2 * burst) * 8000).astype(np.int16)
+        x[2 * s: 2 * (s + burst)] = (rng.normal(size=2 * burst) * sigma).astype(np.int16)
         truth.append((s, (start_ts + s) % spslot))
-    bursts, _ = find_bursts(x, fs, 0.0, 2.0, 0.5, 5.0, 4.0)
+    bursts, floor, _ = find_bursts(x, fs, 0.0, 2.0, 0.6, 5.0, 2.0)
     ok = len(bursts) == len(truth)
     for (s, dur, lvl), (ts_true, mod_true) in zip(bursts, truth):
         mod = (start_ts + s) % spslot
         err = s - ts_true
-        ok &= abs(err) <= 8
-        print(f"burst at sample {s} (true {ts_true}, err {err:+d}), in-slot {mod} (true {mod_true})")
+        ok &= abs(err) <= 24
+        print(f"burst at sample {s} (true {ts_true}, err {err:+d}), in-slot {mod} (true {mod_true}), "
+              f"{lvl:.1f} dB above floor")
     print("selftest", "OK" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
@@ -111,9 +123,10 @@ def main():
     ap.add_argument("--fs", type=float, default=15.36e6)
     ap.add_argument("--window", nargs=2, type=float, default=None, metavar=("T0", "T1"),
                     help="only analyse between these times in the capture (s)")
-    ap.add_argument("--min-ms", type=float, default=0.5, help="minimum burst length (default 0.5 ms)")
+    ap.add_argument("--min-ms", type=float, default=0.6, help="minimum burst length (default 0.6 ms)")
     ap.add_argument("--gap-ms", type=float, default=5.0, help="minimum gap splitting bursts (default 5 ms)")
-    ap.add_argument("--thr", type=float, default=4.0, help="burst threshold over the noise floor (default 4x)")
+    ap.add_argument("--thr", type=float, default=2.0,
+                    help="burst threshold: block power over the median, linear (default 2.0 = +3 dB)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -136,12 +149,17 @@ def main():
     t0, t1 = a.window if a.window else (0.0, dur)
     spslot = int(round(a.fs / 1000))
     print(f"{dur:.1f} s capture at {a.fs/1e6:g} Msps, first-sample timestamp {start_ts}, "
-          f"slot = {spslot} samples; analysing {t0:.1f}-{t1:.1f} s")
-    bursts, floor = find_bursts(data, a.fs, t0, t1, a.min_ms, a.gap_ms, a.thr)
+          f"slot = {spslot} samples; analysing {t0:.1f}-{t1:.1f} s, threshold {a.thr:g}x median block power")
+    bursts, floor, p = find_bursts(data, a.fs, t0, t1, a.min_ms, a.gap_ms, a.thr)
     if not bursts:
-        print(f"no bursts above {a.thr}x the floor; lower --thr or check the window")
+        q = np.percentile(p, [50, 90, 99, 99.9])
+        print(f"no bursts of >= {a.min_ms:g} ms above {a.thr:g}x the floor.")
+        print(f"block power: median {q[0]:.0f}, p90 {q[1] / q[0]:.2f}x, p99 {q[2] / q[0]:.2f}x, "
+              f"p99.9 {q[3] / q[0]:.2f}x, max {p.max() / q[0]:.2f}x of the median")
+        print("a 0.86 ms burst is ~13 blocks of 0.064 ms: if p99.9 is well above 1, retry with "
+              f"--thr {max(1.2, round(float(q[3]) / q[0] * 0.7, 1))}")
         return
-    print("  #   t_in_capture   abs_ts          in-slot sample   in-slot us   length_ms  level_dBFS")
+    print("  #   t_in_capture   abs_ts          in-slot sample   in-slot us   length_ms  above_floor_dB")
     mods = []
     for i, (s, dur_s, lvl) in enumerate(bursts):
         ts = start_ts + s
@@ -149,11 +167,8 @@ def main():
         mods.append(mod)
         print(f"{i:3d}   {s / a.fs:10.4f} s   {ts:13d}   {mod:8d}         {mod / a.fs * 1e6:8.2f}"
               f"     {dur_s / a.fs * 1e3:7.3f}    {lvl:7.1f}")
-    mods = np.array(mods, dtype=float)
-    us = mods / a.fs * 1e6
-    # spread on the circle (slot-periodic)
-    ref = us[0]
-    rel = (us - ref + 500) % 1000 - 500
+    us = np.array(mods, dtype=float) / a.fs * 1e6
+    rel = (us - us[0] + 500) % 1000 - 500
     print(f"\n{len(bursts)} burst(s): in-slot position {us.min():.2f}..{us.max():.2f} us; "
           f"spread relative to the first burst {rel.min():+.2f}..{rel.max():+.2f} us")
     print("A PRACH burst should start at (slot boundary + its CP); the spread across attempts is the true "
