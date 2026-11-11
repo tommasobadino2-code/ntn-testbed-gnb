@@ -72,7 +72,7 @@ kill_ran() {
 
 restart_core() {
     local since
-    since=$(date -u +%Y-%m-%dT%H:%M:%S)
+    since=$(date +%Y-%m-%dT%H:%M:%S)   # local time: docker parses a bare --since timestamp as local
     ( cd "$CORE_DIR" && { [[ -z $CORE_DOWN ]] || eval "$CORE_DOWN"; } && eval "$CORE_UP" ) > "$1/core.out" 2>&1
     for _ in $(seq "$AMF_WAIT"); do
         if docker logs --since "$since" "$AMF_CONTAINER" 2>&1 | grep -q "$AMF_LISTEN"; then
