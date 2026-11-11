@@ -33,10 +33,32 @@ DET_RE = re.compile(r"\[\s*(\d+)\.(\d+)\]\s+PRACH:.*?idx=(\d+) ta=([-0-9.]+)us d
 
 
 def zc_matrix(L):
-    """Frequency-domain ZC sequences x_u(n) = exp(-j pi u n (n+1) / L), u = 1..L-1 (TS 38.211 6.3.3.1)."""
+    """OCUDU's reference sequences, row u-1 for physical root u = 1..L-1.
+
+    OCUDU's PRACH buffer and detector use the DFT of the Zadoff-Chu sequence, FFT(x_u)/sqrt(L) with
+    x_u(n) = exp(-j pi u n (n+1) / L) (prach_generator_impl.cpp "sequence transform"; verified equal to
+    ~1e-15). Correlating against x_u itself finds root -1/u and a root-dependent fake delay.
+    """
     n = np.arange(L)
     u = np.arange(1, L)[:, None]
-    return np.exp(-1j * np.pi * ((u * n * (n + 1)) % (2 * L)) / L).astype(np.complex64)
+    x = np.exp(-1j * np.pi * ((u * n * (n + 1)) % (2 * L)) / L)
+    return (np.fft.fft(x, axis=-1) / np.sqrt(L)).astype(np.complex64)
+
+
+def logical_root(u, L):
+    """Logical root index (TS 38.211 Tables 6.3.3.1-3/-4) of physical root u; None if unknown."""
+    if L == 139:
+        return 2 * (u - 1) if u <= 69 else 2 * (138 - u) + 1
+    try:
+        import os
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "phy", "upper",
+                                "channel_processors", "prach", "prach_generator_impl.cpp")).read()
+        i = src.index("get_sequence_number_long")
+        body = src[src.index("{", i):src.index("};", i)]
+        lut = [int(v) for v in body[body.index("{", 1) + 1:].replace("\n", " ").split(",") if v.strip()]
+        return lut.index(u) if u in lut else None
+    except (OSError, ValueError):
+        return None
 
 
 def centred_idft_input(z, N):
@@ -74,7 +96,7 @@ def selftest():
     for L, scs, reps, u, delay, cfo in [(139, 15e3, 12, 138, -1.2e-6, 200.0), (139, 15e3, 12, 5, 3.4e-6, -900.0),
                                         (839, 1.25e3, 2, 710, 16.0e-6, 100.0), (839, 1.25e3, 2, 129, -0.9e-6, 0.0)]:
         n = np.arange(L)
-        x = np.exp(-1j * np.pi * ((u * n * (n + 1)) % (2 * L)) / L)
+        x = zc_matrix(L)[u - 1]
         f = n - L // 2  # frequency index relative to DC, as the detector's mapping assumes
         Y = np.array([x * np.exp(-2j * np.pi * f * scs * delay) * np.exp(2j * np.pi * cfo * r / scs)
                       for r in range(reps)])
@@ -96,6 +118,8 @@ def main():
     ap.add_argument("--os", type=int, default=16, help="IDFT oversampling (default 16)")
     ap.add_argument("--min-snr-db", type=float, default=10.0,
                     help="skip windows whose power is less than this above the median window power")
+    ap.add_argument("--root-seq-idx", type=int, default=1,
+                    help="prach_root_sequence_index of the cell (default 1), to print the preamble index")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -133,17 +157,20 @@ def main():
         powers.append(float(np.mean(np.abs(data[off:off + sz]) ** 2)))
     powers = np.array(powers)
     floor = np.nanmedian(powers)
-    print("sfn.slot  power_dB(above median)  root_u  delay_us(signed)  peak_dB  cfo_Hz   gNB detection (idx, ta)")
+    print("sfn.slot  power_dB(above median)  root_u  preamble  delay_us(signed)  peak_dB  cfo_Hz   gNB detection (idx, ta)")
     found = []
     for (sfn, slot, _, off, sz), pw in zip(wins, powers):
-        if not np.isfinite(pw) or 10 * np.log10(pw / floor) < a.min_snr_db:
+        if not np.isfinite(pw) or pw <= 0 or 10 * np.log10(pw / floor) < a.min_snr_db:
             continue
         Y = np.asarray(data[off:off + sz]).reshape(-1, L)
         u, d, m, c = analyse_window(Y, X, scs, a.os)
         det = dets.get((sfn, slot))
         det_s = ", ".join(f"idx={i} ta={t:.2f}us" for i, t in det) if det else "NOT DETECTED"
         cfo_s = f"{c:+7.0f}" if c is not None else "      -"
-        print(f"{sfn:4d}.{slot:<2d}   {10*np.log10(pw/floor):6.1f}               {u:4d}   {d*1e6:+9.3f}"
+        lr = logical_root(u, L)
+        pre = (lr - a.root_seq_idx) % (L - 1) if lr is not None else None
+        pre_s = f"{pre:4d}" if pre is not None and pre < 64 else "   ?"
+        print(f"{sfn:4d}.{slot:<2d}   {10*np.log10(pw/floor):6.1f}               {u:4d}    {pre_s}  {d*1e6:+9.3f}"
               f"        {m:5.1f}   {cfo_s}   {det_s}")
         found.append(d * 1e6)
     if found:
